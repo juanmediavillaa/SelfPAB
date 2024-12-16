@@ -617,6 +617,8 @@ class STFTDataset(HARDataset):
         # Windowed labels handling
         self.windowed_labels_kind = args['windowed_labels_kind'] \
                 if 'windowed_labels_kind' in args else 'argmax'
+        self.return_timestamps = args['return_timestamps'] if 'return_timestamps' in args else False
+        self.timestamp_column = args['timestamp_column'] if 'timestamp_column' in args else 'timestamp'
         super().__init__(
             root_dir=root_dir,
             config_path=config_path,
@@ -659,6 +661,8 @@ class STFTDataset(HARDataset):
         win_len = end_idx - start_idx
         # Determine window to return:
         x = self.data[fn][0][start_idx:end_idx]
+        if self.ts_data:
+            x_ts = self.ts_data[fn][start_idx:end_idx]
         if self.inference_mode:
             if len(x) != len(self.data[fn][0]):
                 # In inference_mode padding is applied, otherwise shape mismatch
@@ -670,11 +674,22 @@ class STFTDataset(HARDataset):
                 )
                 if self.unstack_sensors:
                     x = self._unstack_sensors(x)
+                if self.ts_data:
+                    x_ts = self._pad_timestamps(x_ts, overflow)
+                    x_ts = src.utils.timestamps_to_tensor(x_ts)
+                    x = (x, x_ts)
+                return x
+            if self.ts_data:
+                x_ts = src.utils.timestamps_to_tensor(x_ts)
+                x = (x, x_ts)
             return x
         else:
             y = self.data[fn][1][start_idx:end_idx]
             if self.unstack_sensors:
                 x = self._unstack_sensors(x)
+            if self.ts_data:
+                x_ts = src.utils.timestamps_to_tensor(x_ts)
+                x = (x, x_ts)
             return x, y
 
     def __len__(self):
@@ -834,6 +849,11 @@ class STFTDataset(HARDataset):
         filenames = [x for x in os.listdir(root_path) \
                      if x not in self.skip_files]
         uc = self.x_columns+[self.y_column]
+        if self.return_timestamps:
+            uc = [self.timestamp_column] + uc
+            self.ts_data = {}
+        else:
+            self.ts_data = None
         for fn in tqdm(filenames):
             df = pd.read_csv(
                 os.path.join(root_path, fn),
@@ -855,6 +875,8 @@ class STFTDataset(HARDataset):
             # Resampling if required
             if self.source_freq != self.target_freq:
                 discrete_columns=[self.y_column]
+                if self.return_timestamps:
+                    discrete_columns+=[self.timestamp_column]
                 df = src.utils.resample(
                     signal=df,
                     source_rate=self.source_freq,
@@ -913,6 +935,17 @@ class STFTDataset(HARDataset):
                 data[fn] = (x, y)
             else:
                 data[fn] = (x, None)
+            if self.return_timestamps:
+                x_ts = windowed_timestamps(
+                    df[self.timestamp_column].values,
+                    frame_length=self.n_fft,
+                    frame_step=self.hop_length,
+                    pad_end=self.inference_mode,
+                    kind='center'
+                )
+                x_ts = [datetime.datetime.strptime(_ts[:26],'%Y-%m-%d %H:%M:%S.%f') \
+                        for _ts in x_ts]
+                self.ts_data[fn] = x_ts
         return data
 
     def _get_data_ranges(self):
@@ -1033,9 +1066,18 @@ class STFTDataset(HARDataset):
 
     def collate_fn(self, data):
         '''Custom collate_fn for different sequence lengths in a batch'''
-        x = torch.nn.utils.rnn.pad_sequence([d[0] for d in data],
-                                            batch_first=True,
-                                            padding_value=0.0)
+        if self.ts_data:
+            x = torch.nn.utils.rnn.pad_sequence([d[0][0] for d in data],
+                                                batch_first=True,
+                                                padding_value=0.0)
+            a = torch.nn.utils.rnn.pad_sequence([d[0][1] for d in data],
+                                                batch_first=True,
+                                                padding_value=0.0)
+            x = [x,a]
+        else:
+            x = torch.nn.utils.rnn.pad_sequence([d[0] for d in data],
+                                                batch_first=True,
+                                                padding_value=0.0)
         y = torch.nn.utils.rnn.pad_sequence([d[1] for d in data],
                                             batch_first=True,
                                             padding_value=0)

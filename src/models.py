@@ -174,20 +174,23 @@ class DownstreamMLP(pl.LightningModule):
         # For weight_sharing only 1 upstream model is used but repetitively
         _actual_upstream_branches = 1 \
                 if self.weight_sharing else self.upstream_branches
+        rmv_GPE = args['rmv_GPE'] if 'rmv_GPE' in args else False
         for ub in range(_actual_upstream_branches):
             self.upstream_models.extend([UpstreamModel(
                 algorithm_name=args['upstream_algorithm'],
                 model_path=args['upstream_model_path'],
                 cut_layers=args['rmv_upstream_layers'],
                 weighted_sum_layer=args['weighted_sum_layer'],
-                random_weight_init=rw
+                random_weight_init=rw,
+                rmv_GPE=rmv_GPE
             )])
         for um in self.upstream_models: um.freeze()
         # When to unfreeze in percent of total step count
         self.fine_tune_step = args['fine_tune_step']
         self.total_step_count = args['total_step_count']
         assert 0 <= self.fine_tune_step <= 1
-        ph_dim = self._get_upstream_output_dim(input_dim=args['input_dim'])
+        ph_dim = self._get_upstream_output_dim(input_dim=args['input_dim'],
+                                               sequence_length=args['sequence_length'])
         self.prediction_head = get_pred_head(
             num_layers=args['n_prediction_head_layers'],
             input_dim=ph_dim,
@@ -297,7 +300,10 @@ class DownstreamMLP(pl.LightningModule):
                 metric(einops.rearrange(y, 'N S C -> (N S) C'),
                        einops.rearrange(y_hat_prob, 'N S C -> (N S) C'))
             else:
-                metric(einops.rearrange(y_hat, 'N S C -> N C S'), y)
+                if len(y_hat.shape)==3:
+                    metric(einops.rearrange(y_hat, 'N S C -> N C S'), y)
+                else:
+                    metric(y_hat, y)
             self.log(
                 step_call+'_'+str(metric),
                 metric,
@@ -306,7 +312,7 @@ class DownstreamMLP(pl.LightningModule):
                 on_epoch=True
             )
 
-    def _get_upstream_output_dim(self, input_dim):
+    def _get_upstream_output_dim(self, input_dim, sequence_length=1):
         try:
             ph_dim = self.upstream_models[0](
                 torch.rand([1, 1, input_dim//self.upstream_branches])
@@ -316,6 +322,10 @@ class DownstreamMLP(pl.LightningModule):
                 torch.rand([1, 1, input_dim//self.upstream_branches]),
                 torch.rand([1, 1, 5])
             ]).shape[-1]
+        except RuntimeError:
+            ph_dim = self.upstream_models[0](
+                torch.rand([1, sequence_length, input_dim//self.upstream_branches])
+            ).shape[-1]
         if self.branch_merge_operation == 'concat':
             ph_dim = ph_dim * self.upstream_branches
         return ph_dim
@@ -906,7 +916,7 @@ def get_pos_encoder(encoder_names, **kwargs):
 class UpstreamModel(pl.LightningModule):
     def __init__(self, algorithm_name, model_path,
                  cut_layers, weighted_sum_layer=None,
-                 random_weight_init=False):
+                 random_weight_init=False, rmv_GPE=False):
         '''General purpose upstream model
 
         Parameters
@@ -930,18 +940,26 @@ class UpstreamModel(pl.LightningModule):
         if random_weight_init:
             print('Use random weights for upstream model')
             cp_model = model_cls(cp_model.algorithm_args)
-        self.upstream_model = []
-        for i, l in enumerate(list(cp_model.children())[:-cut_layers]):
-            if self.do_weighted_sum and i == weighted_sum_layer:
-                _l = [p for p in l.children()][0] \
-                     if type(l)==TransformerEncoder \
-                     else l
-                num_ws_weights = 0
-                for j, subl in enumerate(_l.children()):
-                    num_ws_weights += 1
-                    subl.register_forward_hook(self.get_layer_output(str(j)))
-            self.upstream_model.append(l)
-        self.upstream_model = torch.nn.Sequential(*self.upstream_model)
+        if cut_layers>0:
+            self.upstream_model = []
+            for i, l in enumerate(list(cp_model.children())[:-cut_layers]):
+                if type(l)==InputEmbeddingPosEncoding and rmv_GPE:
+                    new_dict_ie={'input_dim':l.lin_proj_layer.in_features,
+                                 'd_model':l.lin_proj_layer.out_features,
+                                 'positional_encoding': ['AbsolutePositionalEncoding']}
+                    l = InputEmbeddingPosEncoding(new_dict_ie)
+                if self.do_weighted_sum and i == weighted_sum_layer:
+                    _l = [p for p in l.children()][0] \
+                         if type(l)==TransformerEncoder \
+                         else l
+                    num_ws_weights = 0
+                    for j, subl in enumerate(_l.children()):
+                        num_ws_weights += 1
+                        subl.register_forward_hook(self.get_layer_output(str(j)))
+                self.upstream_model.append(l)
+            self.upstream_model = torch.nn.Sequential(*self.upstream_model)
+        else:
+            self.upstream_model = cp_model
         if self.do_weighted_sum:
             self.weighted_sum = LinearWeightedSum(num_ws_weights)
         self.frozen = False
